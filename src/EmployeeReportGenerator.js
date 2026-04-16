@@ -1,9 +1,9 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useCallback } from "react";
 import ExcelJS from "exceljs";
 import { saveAs } from "file-saver";
 import "bootstrap/dist/css/bootstrap.min.css";
  
-const INITIAL_EMPLOYEE_DATA = [
+const MASTER = [
   { id: 10411774, name: "Varsha Mahadevan" },
   { id: 10412819, name: "Saquib Tanweer" },
   { id: 10412814, name: "Jeff Rohit" },
@@ -204,31 +204,41 @@ const INITIAL_EMPLOYEE_DATA = [
   { id: 10547545, name: "Vikram Sudhakaran" },
 ];
  
-function makeEntry(emp) {
-  return { ...emp, status: "pending", message: "" };
+// ── Parse bulk textarea ───────────────────────────────────────────────────
+function parseBulkText(text) {
+  const valid = [], errors = [];
+  text.split("\n").forEach((line, idx) => {
+    const raw = line.trim();
+    if (!raw) return;
+    const parts = raw.split(/[,\t]/).map((p) => p.trim());
+    const id = parseInt(parts[0], 10);
+    const name = parts.slice(1).join(" ").trim();
+    if (isNaN(id) || parts.length < 2) {
+      errors.push(`Line ${idx + 1}: "${raw}" — expected "ID, Name"`);
+    } else if (!name) {
+      errors.push(`Line ${idx + 1}: name is empty`);
+    } else {
+      valid.push({ id, name });
+    }
+  });
+  return { valid, errors };
 }
  
-function copyWorksheet(srcSheet, destSheet) {
-  srcSheet.columns.forEach((col, i) => {
-    if (col.width) destSheet.getColumn(i + 1).width = col.width;
-  });
-  srcSheet.eachRow({ includeEmpty: true }, (srcRow, rowNumber) => {
-    const destRow = destSheet.getRow(rowNumber);
+function copyWorksheet(src, dest) {
+  src.columns.forEach((col, i) => { if (col.width) dest.getColumn(i + 1).width = col.width; });
+  src.eachRow({ includeEmpty: true }, (srcRow, rn) => {
+    const destRow = dest.getRow(rn);
     destRow.height = srcRow.height;
-    srcRow.eachCell({ includeEmpty: true }, (srcCell, colNumber) => {
-      const destCell = destRow.getCell(colNumber);
-      if (srcCell.value && typeof srcCell.value === "object" && srcCell.value.formula) {
-        destCell.value = { ...srcCell.value };
-      } else {
-        destCell.value = srcCell.value;
-      }
-      destCell.style = JSON.parse(JSON.stringify(srcCell.style));
+    srcRow.eachCell({ includeEmpty: true }, (srcCell, cn) => {
+      const dc = destRow.getCell(cn);
+      dc.value = (srcCell.value && typeof srcCell.value === "object" && srcCell.value.formula)
+        ? { ...srcCell.value }
+        : srcCell.value;
+      dc.style = JSON.parse(JSON.stringify(srcCell.style));
     });
     destRow.commit();
   });
-  try {
-    Object.keys(srcSheet._merges || {}).forEach((key) => destSheet.mergeCells(key));
-  } catch (_) {}
+  try { Object.keys(src._merges || {}).forEach((k) => dest.mergeCells(k)); } catch (_) {}
 }
  
 const STATUS_META = {
@@ -238,9 +248,17 @@ const STATUS_META = {
   skipped:    { bg: "#e2e3e5", color: "#41464b", label: "Skipped"      },
   error:      { bg: "#f8d7da", color: "#842029", label: "Error"        },
 };
-// heydfdfdsdfdfdfdf
- 
 const LOG_COLOR = { info: "#d4d4d4", success: "#6fcf97", warn: "#f2c94c", error: "#eb5757" };
+ 
+const Badge = ({ status }) => {
+  const m = STATUS_META[status] || STATUS_META.pending;
+  return (
+    <span style={{ background: m.bg, color: m.color, borderRadius: 4,
+      padding: "2px 8px", fontSize: 12, fontWeight: 500, whiteSpace: "nowrap" }}>
+      {m.label}
+    </span>
+  );
+};
  
 export default function EmployeeReportGenerator() {
   const [file, setFile]                   = useState(null);
@@ -248,23 +266,26 @@ export default function EmployeeReportGenerator() {
   const [selectedColor, setSelectedColor] = useState("#D9E1F2");
   const [isProcessing, setIsProcessing]   = useState(false);
  
-  const [newId, setNewId]       = useState("");
-  const [newName, setNewName]   = useState("");
-  const [idStatus, setIdStatus] = useState(null);
+  // ── Single input ──────────────────────────────────────────────────────────
+  const [singleId, setSingleId]     = useState("");
+  const [singleName, setSingleName] = useState("");
+  const [idStatus, setIdStatus]     = useState(null);
  
-  const [bulkInput, setBulkInput]   = useState("");
+  // ── Bulk input ────────────────────────────────────────────────────────────
+  const [bulkText, setBulkText]     = useState("");
   const [bulkErrors, setBulkErrors] = useState([]);
  
-  const [queue, setQueue]           = useState([]);
+  // ── Confirmed queue ───────────────────────────────────────────────────────
+  const [queue, setQueue] = useState([]);
+ 
+  // ── Progress log ──────────────────────────────────────────────────────────
   const [progressLog, setProgressLog] = useState([]);
   const logRef = useRef(null);
  
   const addLog = (msg, type = "info") => {
     setProgressLog((prev) => {
       const next = [...prev, { msg, type }];
-      setTimeout(() => {
-        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-      }, 40);
+      setTimeout(() => { if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight; }, 40);
       return next;
     });
   };
@@ -272,164 +293,256 @@ export default function EmployeeReportGenerator() {
   const setEntryStatus = (id, status, message = "") =>
     setQueue((prev) => prev.map((e) => e.id === id ? { ...e, status, message } : e));
  
-  // ── Row helpers ──────────────────────────────────────────────────────────
+  // ── Single ID change → auto-lookup ────────────────────────────────────────
+  const handleSingleIdChange = (v) => {
+    setSingleId(v);
+    const parsed = parseInt(v, 10);
+    if (!isNaN(parsed)) {
+      const match = MASTER.find((e) => e.id === parsed);
+      if (match) { setSingleName(match.name); setIdStatus("found"); }
+      else        { setSingleName("");        setIdStatus("not_found"); }
+    } else { setSingleName(""); setIdStatus(null); }
+  };
+ 
+  // ── Add single to queue ───────────────────────────────────────────────────
+  const addSingleToQueue = () => {
+    const parsed = parseInt(singleId, 10);
+    if (isNaN(parsed) || !singleName.trim()) { alert("Enter a valid ID and name."); return; }
+    if (queue.some((e) => e.id === parsed)) { alert(`ID ${parsed} is already in the queue.`); return; }
+    setQueue((prev) => [...prev, { id: parsed, name: singleName.trim(), status: "pending", message: "", source: "single" }]);
+    setSingleId(""); setSingleName(""); setIdStatus(null);
+  };
+ 
+  // ── Bulk live parse (deduped against queue) ───────────────────────────────
+  const bulkParsed = (() => {
+    if (!bulkText.trim()) return { valid: [], errors: [] };
+    const { valid, errors } = parseBulkText(bulkText);
+    const queueIds = new Set(queue.map((e) => e.id));
+    const deduped = [], dupeWarns = [];
+    valid.forEach((e) => {
+      if (queueIds.has(e.id) || deduped.some((d) => d.id === e.id)) {
+        dupeWarns.push(`ID ${e.id} already in queue — will be skipped`);
+      } else {
+        deduped.push(e);
+      }
+    });
+    return { valid: deduped, errors: [...errors, ...dupeWarns] };
+  })();
+ 
+  const addBulkToQueue = () => {
+    if (!bulkParsed.valid.length) { alert("No valid entries to add."); return; }
+    setBulkErrors(bulkParsed.errors);
+    setQueue((prev) => [
+      ...prev,
+      ...bulkParsed.valid.map((e) => ({ ...e, status: "pending", message: "", source: "bulk" })),
+    ]);
+    setBulkText("");
+    setBulkErrors([]);
+  };
+ 
+  // ── Build effective user list at process time ─────────────────────────────
+  const buildEffectiveList = useCallback(() => {
+    const seen = new Set();
+    const list = [];
+    queue.forEach((e) => { seen.add(e.id); list.push({ id: e.id, name: e.name }); });
+    if (bulkText.trim()) {
+      const { valid } = parseBulkText(bulkText);
+      valid.forEach((e) => {
+        if (!seen.has(e.id)) { seen.add(e.id); list.push(e); }
+      });
+    }
+    const parsedSingle = parseInt(singleId, 10);
+    if (!isNaN(parsedSingle) && singleName.trim() && !seen.has(parsedSingle)) {
+      list.push({ id: parsedSingle, name: singleName.trim() });
+    }
+    return list;
+  }, [queue, bulkText, singleId, singleName]);
+ 
+  const effectiveList = buildEffectiveList();
+ 
+  // ── Determine what actions will be performed ──────────────────────────────
+  const hasRowsToInsert = rowsToInsert.some((r) => r.trim() !== "");
+  const hasUsers        = effectiveList.length > 0;
+ 
+  // Button is enabled when: file is uploaded AND (rows to insert OR users to process)
+  const canProcess = !!file && !isProcessing && (hasRowsToInsert || hasUsers);
+ 
+  // Build a human-readable label for what will happen
+  const getButtonLabel = () => {
+    if (isProcessing) {
+      return (
+        <>
+          <span className="spinner-border spinner-border-sm me-2" />
+          Processing…
+        </>
+      );
+    }
+    if (!file) return "Process & Download";
+    const parts = [];
+    if (hasRowsToInsert) parts.push(`${rowsToInsert.filter(r => r.trim()).length} row${rowsToInsert.filter(r => r.trim()).length !== 1 ? "s" : ""}`);
+    if (hasUsers) parts.push(`${effectiveList.length} user${effectiveList.length !== 1 ? "s" : ""}`);
+    if (parts.length === 0) return "Process & Download";
+    return `Process & Download — ${parts.join(" + ")}`;
+  };
+ 
+  // Row helpers
   const handleRowChange = (i, v) => {
     const u = [...rowsToInsert]; u[i] = v; setRowsToInsert(u);
   };
  
-  // ── Single-add ───────────────────────────────────────────────────────────
-  const handleIdChange = (v) => {
-    setNewId(v);
-    const parsed = parseInt(v, 10);
-    if (!isNaN(parsed)) {
-      const match = INITIAL_EMPLOYEE_DATA.find((e) => e.id === parsed);
-      if (match) { setNewName(match.name); setIdStatus("found"); }
-      else        { setNewName("");        setIdStatus("not_found"); }
-    } else { setNewName(""); setIdStatus(null); }
-  };
- 
-  const handleAddSingle = () => {
-    const parsed = parseInt(newId, 10);
-    if (isNaN(parsed) || !newName.trim()) { alert("Enter a valid ID and name."); return; }
-    if (queue.some((e) => e.id === parsed)) { alert(`ID ${parsed} already in queue.`); return; }
-    setQueue((prev) => [...prev, makeEntry({ id: parsed, name: newName.trim() })]);
-    setNewId(""); setNewName(""); setIdStatus(null);
-  };
- 
-  // ── Bulk-add ─────────────────────────────────────────────────────────────
-  const handleBulkAdd = () => {
-    const lines = bulkInput.split("\n").map((l) => l.trim()).filter(Boolean);
-    const errors = [], added = [];
-    lines.forEach((line, idx) => {
-      const parts = line.split(/[,\t]/).map((p) => p.trim());
-      const id    = parseInt(parts[0], 10);
-      const name  = parts.slice(1).join(" ").trim();
-      if (parts.length < 2 || isNaN(id))   { errors.push(`Line ${idx + 1}: bad format — expected "ID, Name"`); return; }
-      if (!name)                            { errors.push(`Line ${idx + 1}: name is empty`); return; }
-      if (queue.some((e) => e.id === id) || added.some((e) => e.id === id)) {
-        errors.push(`Line ${idx + 1}: ID ${id} duplicate — skipped`); return;
-      }
-      added.push(makeEntry({ id, name }));
-    });
-    setBulkErrors(errors);
-    if (added.length) { setQueue((prev) => [...prev, ...added]); setBulkInput(""); }
-  };
- 
-  // ── Process ───────────────────────────────────────────────────────────────
+  // ── Main process ──────────────────────────────────────────────────────────
   const processFile = async () => {
-    if (!file)          { alert("Upload an Excel file first.");       return; }
-    if (!queue.length)  { alert("Add at least one user to the queue."); return; }
+    if (!file) { alert("Upload an Excel file first."); return; }
+    if (!hasRowsToInsert && !hasUsers) {
+      alert("Nothing to process. Add rows to insert and/or users to create sheets for.");
+      return;
+    }
  
+    // Flush single + bulk into queue so status badges are visible
+    const allEntries = effectiveList.map((e) => ({ ...e, status: "pending", message: "" }));
+    setQueue(allEntries);
+    setSingleId(""); setSingleName(""); setIdStatus(null);
+    setBulkText(""); setBulkErrors([]);
     setIsProcessing(true);
     setProgressLog([]);
-    setQueue((prev) => prev.map((e) => ({ ...e, status: "pending", message: "" })));
+ 
+    await new Promise((res) => setTimeout(res, 60));
  
     try {
       addLog("Reading workbook…");
       const buffer = await file.arrayBuffer();
       const workbook = new ExcelJS.Workbook();
       await workbook.xlsx.load(buffer);
-      addLog("Workbook loaded.", "success");
+      addLog(`Workbook loaded — ${workbook.worksheets.length} sheet(s) found.`, "success");
  
-      if (rowsToInsert.some((r) => r.trim())) {
-        addLog("Inserting rows above 'Utilization %'…");
+      // ── Insert rows ──────────────────────────────────────────────────────
+      const activeRows = rowsToInsert.filter((r) => r.trim() !== "");
+      if (activeRows.length > 0) {
+        addLog(`Inserting ${activeRows.length} row(s) above "Utilization %"…`);
+        let insertedOnAnySheet = false;
         workbook.eachSheet((ws) => {
           let target = null;
           ws.eachRow((row, ri) => row.eachCell((c) => {
             if (c.value?.toString().toLowerCase() === "utilization %") target = ri;
           }));
           if (target !== null) {
-            const maxCol = ws.columnCount;
-            rowsToInsert.forEach((val, i) => {
+            insertedOnAnySheet = true;
+            activeRows.forEach((val, i) => {
               const at = target + i;
               ws.spliceRows(at, 0, []);
               const nr = ws.getRow(at);
               nr.getCell(1).value = val;
-              for (let col = 1; col <= maxCol; col++) {
+              for (let col = 1; col <= ws.columnCount; col++) {
                 const cell = nr.getCell(col);
                 cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF" + selectedColor.replace("#", "") } };
                 cell.font = { bold: true };
                 cell.alignment = { horizontal: "center" };
-                cell.border = { top: { style: "thin" }, left: { style: "thin" }, bottom: { style: "thin" }, right: { style: "thin" } };
+                cell.border = {
+                  top: { style: "thin" }, left: { style: "thin" },
+                  bottom: { style: "thin" }, right: { style: "thin" }
+                };
               }
               nr.commit();
             });
           }
         });
-        addLog("Rows inserted.", "success");
-      }
- 
-      const refSheet = workbook.getWorksheet("REF");
-      if (!refSheet) {
-        addLog("REF sheet not found — cannot create user sheets.", "error");
-      } else {
-        const existingNames = new Set(workbook.worksheets.map((s) => s.name));
-        addLog(`Creating sheets for ${queue.length} user(s)…`);
- 
-        for (const emp of queue) {
-          setEntryStatus(emp.id, "processing");
-          await new Promise((res) => setTimeout(res, 40));
- 
-          if (existingNames.has(emp.name)) {
-            setEntryStatus(emp.id, "skipped", "sheet already exists");
-            addLog(`  ⊘  ${emp.name} — skipped (sheet exists)`, "warn");
-            continue;
-          }
-          try {
-            const newSheet = workbook.addWorksheet(emp.name);
-            copyWorksheet(refSheet, newSheet);
-            newSheet.getCell("A1").value = emp.id;
-            existingNames.add(emp.name);
-            setEntryStatus(emp.id, "done", "sheet created");
-            addLog(`  ✓  ${emp.name} (${emp.id}) — sheet created`, "success");
-          } catch (err) {
-            setEntryStatus(emp.id, "error", err.message);
-            addLog(`  ✗  ${emp.name} — ${err.message}`, "error");
-          }
-          await new Promise((res) => setTimeout(res, 40));
+        if (insertedOnAnySheet) {
+          addLog(`${activeRows.length} row(s) inserted successfully.`, "success");
+        } else {
+          addLog('No sheet contained "Utilization %" — rows were not inserted.', "warn");
         }
+      } else {
+        addLog("No rows to insert — skipping row insertion.", "info");
       }
  
-      addLog("Writing output…");
+      // ── Create employee sheets ────────────────────────────────────────────
+      if (allEntries.length > 0) {
+        const refSheet = workbook.getWorksheet("REF");
+        if (!refSheet) {
+          addLog("REF sheet not found — employee sheets will not be created.", "error");
+          allEntries.forEach((emp) => setEntryStatus(emp.id, "error", "REF sheet missing"));
+        } else {
+          const existingNames = new Set(workbook.worksheets.map((s) => s.name));
+          addLog(`Creating sheets for ${allEntries.length} user(s)…`);
+ 
+          for (const emp of allEntries) {
+            setEntryStatus(emp.id, "processing");
+            await new Promise((res) => setTimeout(res, 40));
+ 
+            if (existingNames.has(emp.name)) {
+              setEntryStatus(emp.id, "skipped", "sheet already exists");
+              addLog(`  ⊘  ${emp.name} — skipped (sheet exists)`, "warn");
+              continue;
+            }
+            try {
+              const newSheet = workbook.addWorksheet(emp.name);
+              copyWorksheet(refSheet, newSheet);
+              newSheet.getCell("A1").value = emp.id;
+              existingNames.add(emp.name);
+              setEntryStatus(emp.id, "done", "sheet created");
+              addLog(`  ✓  ${emp.name} (${emp.id})`, "success");
+            } catch (err) {
+              setEntryStatus(emp.id, "error", err.message);
+              addLog(`  ✗  ${emp.name} — ${err.message}`, "error");
+            }
+            await new Promise((res) => setTimeout(res, 40));
+          }
+        }
+      } else {
+        addLog("No users to process — skipping sheet creation.", "info");
+      }
+ 
+      addLog("Writing output file…");
       const out = await workbook.xlsx.writeBuffer();
       saveAs(new Blob([out]), "Updated_File.xlsx");
       addLog("Downloaded successfully!", "success");
     } catch (err) {
-      addLog(`Fatal: ${err.message}`, "error");
+      addLog(`Fatal error: ${err.message}`, "error");
       console.error(err);
     } finally {
       setIsProcessing(false);
     }
   };
  
-  // ── Derived counts ────────────────────────────────────────────────────────
-  const counts = queue.reduce((acc, e) => { acc[e.status] = (acc[e.status] || 0) + 1; return acc; }, {});
+  const counts = queue.reduce((a, e) => { a[e.status] = (a[e.status] || 0) + 1; return a; }, {});
+  const totalEffective = effectiveList.length;
  
-  const Badge = ({ status }) => {
-    const m = STATUS_META[status];
-    return (
-      <span style={{ background: m.bg, color: m.color, borderRadius: 4,
-        padding: "2px 8px", fontSize: 12, fontWeight: 500, whiteSpace: "nowrap" }}>
-        {m.label}
-      </span>
-    );
+  // ── What will happen summary (shown below button) ─────────────────────────
+  const getSummaryParts = () => {
+    const parts = [];
+    const activeRows = rowsToInsert.filter((r) => r.trim() !== "");
+    if (activeRows.length > 0) parts.push(`insert ${activeRows.length} row${activeRows.length !== 1 ? "s" : ""}`);
+    if (queue.length > 0) parts.push(`${queue.length} queued user${queue.length !== 1 ? "s" : ""}`);
+    if (bulkParsed.valid.length > 0) parts.push(`${bulkParsed.valid.length} from bulk textarea`);
+    const parsedSingle = parseInt(singleId, 10);
+    if (!isNaN(parsedSingle) && singleName && !queue.some((e) => e.id === parsedSingle)) {
+      parts.push("1 from single field");
+    }
+    return parts;
   };
  
+  const summaryParts = getSummaryParts();
+ 
   return (
-    <div className="container mt-4 mb-5" style={{ maxWidth: 860 }}>
+    <div className="container mt-4 mb-5" style={{ maxWidth: 880 }}>
       <div className="card shadow-sm p-4">
         <h4 className="text-center mb-4">Stats New Process Installer</h4>
  
-        {/* File */}
+        {/* ── File ── */}
         <div className="mb-3">
           <label className="form-label fw-semibold">Upload Excel file</label>
           <input type="file" className="form-control" accept=".xlsx"
             onChange={(e) => setFile(e.target.files[0])} />
         </div>
  
-        {/* Rows */}
+        {/* ── Rows ── */}
         <div className="mb-3">
-          <label className="form-label fw-semibold">Rows to insert above "Utilization %"</label>
+          <label className="form-label fw-semibold">
+            Rows to insert above "Utilization %"
+            <span className="ms-2 text-muted" style={{ fontSize: 13, fontWeight: 400 }}>
+              (optional — leave blank to skip)
+            </span>
+          </label>
           {rowsToInsert.map((row, i) => (
             <div className="input-group mb-2" key={i}>
               <input type="text" className="form-control" value={row}
@@ -446,7 +559,7 @@ export default function EmployeeReportGenerator() {
           )}
         </div>
  
-        {/* Colour */}
+        {/* ── Colour ── */}
         <div className="mb-4 d-flex align-items-center gap-3">
           <label className="form-label fw-semibold mb-0">Row colour</label>
           <input type="color" className="form-control form-control-color" style={{ width: 48 }}
@@ -455,79 +568,137 @@ export default function EmployeeReportGenerator() {
         </div>
  
         <hr />
-        <h5 className="mb-3">Add new users to queue</h5>
  
-        <div className="row g-3 mb-4">
+        {/* ── User inputs ── */}
+        <div className="d-flex align-items-center justify-content-between mb-2">
+          <h5 className="mb-0">
+            Add new users
+            <span className="ms-2 text-muted" style={{ fontSize: 13, fontWeight: 400 }}>
+              (optional — skip if only inserting rows)
+            </span>
+          </h5>
+          {totalEffective > 0 && (
+            <span style={{ fontSize: 13, background: "#d1e7dd", color: "#0f5132",
+              borderRadius: 20, padding: "3px 12px", fontWeight: 500 }}>
+              {totalEffective} user{totalEffective !== 1 ? "s" : ""} ready
+            </span>
+          )}
+        </div>
+ 
+        {/* ── Active mode indicator ── */}
+        {file && (
+          <div className="mb-3 d-flex gap-2 flex-wrap" style={{ fontSize: 13 }}>
+            <span style={{
+              padding: "3px 10px", borderRadius: 20, fontWeight: 500,
+              background: hasRowsToInsert ? "#d1e7dd" : "#f1f3f5",
+              color: hasRowsToInsert ? "#0f5132" : "#6c757d"
+            }}>
+              {hasRowsToInsert ? "✓" : "○"} Row insertion {hasRowsToInsert ? "active" : "inactive"}
+            </span>
+            <span style={{
+              padding: "3px 10px", borderRadius: 20, fontWeight: 500,
+              background: hasUsers ? "#d1e7dd" : "#f1f3f5",
+              color: hasUsers ? "#0f5132" : "#6c757d"
+            }}>
+              {hasUsers ? "✓" : "○"} Sheet creation {hasUsers ? "active" : "inactive"}
+            </span>
+          </div>
+        )}
+ 
+        <div className="row g-3 mb-3">
           {/* Single */}
           <div className="col-md-5">
             <div className="card border p-3 h-100">
               <p className="fw-semibold mb-2" style={{ fontSize: 14 }}>Single user</p>
               <input type="text"
                 className={`form-control form-control-sm mb-1 ${idStatus === "found" ? "is-valid" : idStatus === "not_found" ? "is-invalid" : ""}`}
-                placeholder="Employee ID" value={newId}
-                onChange={(e) => handleIdChange(e.target.value)} />
+                placeholder="Employee ID" value={singleId}
+                onChange={(e) => handleSingleIdChange(e.target.value)}
+                disabled={isProcessing} />
               {idStatus === "found"     && <div className="valid-feedback d-block mb-1" style={{ fontSize: 12 }}>Auto-filled from master list</div>}
               {idStatus === "not_found" && <div className="invalid-feedback d-block mb-1" style={{ fontSize: 12 }}>Not in master — enter name manually</div>}
               <input type="text" className="form-control form-control-sm mb-2"
-                placeholder="Employee name" value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && handleAddSingle()} />
-              <button className="btn btn-primary btn-sm" onClick={handleAddSingle}>Add to queue</button>
+                placeholder="Employee name" value={singleName}
+                onChange={(e) => setSingleName(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && addSingleToQueue()}
+                disabled={isProcessing} />
+              <button className="btn btn-outline-primary btn-sm" onClick={addSingleToQueue} disabled={isProcessing}>
+                + Add to queue
+              </button>
+              {singleId && singleName && !isProcessing && (
+                <p style={{ fontSize: 11, color: "#856404", marginTop: 6, marginBottom: 0 }}>
+                  ↑ Click above to queue, or just hit Process — this entry is included either way.
+                </p>
+              )}
             </div>
           </div>
  
           {/* Bulk */}
           <div className="col-md-7">
             <div className="card border p-3 h-100">
-              <p className="fw-semibold mb-1" style={{ fontSize: 14 }}>
-                Bulk add
-                <span style={{ fontWeight: 400, color: "#6c757d", fontSize: 13 }}> — one per line: ID, Name</span>
-              </p>
+              <div className="d-flex align-items-center justify-content-between mb-1">
+                <p className="fw-semibold mb-0" style={{ fontSize: 14 }}>
+                  Bulk add
+                  <span style={{ fontWeight: 400, color: "#6c757d", fontSize: 13 }}> — ID, Name (one per line)</span>
+                </p>
+                {bulkParsed.valid.length > 0 && (
+                  <span style={{ fontSize: 12, background: "#cfe2ff", color: "#084298",
+                    borderRadius: 20, padding: "2px 10px", fontWeight: 500 }}>
+                    {bulkParsed.valid.length} valid
+                  </span>
+                )}
+              </div>
               <textarea className="form-control form-control-sm mb-2" rows={5}
                 placeholder={"10512345, Ravi Kumar\n10512346, Anitha Devi\n10512347, Karthik R"}
-                value={bulkInput} onChange={(e) => setBulkInput(e.target.value)} />
-              {bulkErrors.length > 0 && (
+                value={bulkText} onChange={(e) => { setBulkText(e.target.value); setBulkErrors([]); }}
+                disabled={isProcessing} />
+              {(bulkErrors.length > 0 || bulkParsed.errors.length > 0) && (
                 <ul className="mb-2" style={{ fontSize: 12, color: "#842029", paddingLeft: 18 }}>
-                  {bulkErrors.map((err, i) => <li key={i}>{err}</li>)}
+                  {(bulkErrors.length ? bulkErrors : bulkParsed.errors).map((err, i) => <li key={i}>{err}</li>)}
                 </ul>
               )}
-              <button className="btn btn-primary btn-sm" onClick={handleBulkAdd}>
-                Add all to queue
-              </button>
+              <div className="d-flex gap-2">
+                <button className="btn btn-outline-primary btn-sm flex-grow-1"
+                  onClick={addBulkToQueue} disabled={isProcessing || !bulkParsed.valid.length}>
+                  + Add all to queue
+                </button>
+                {bulkText.trim() && !isProcessing && (
+                  <span style={{ fontSize: 11, color: "#6c757d", alignSelf: "center" }}>
+                    or just hit Process below
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>
  
-        {/* Queue table */}
+        {/* ── Queue table ── */}
         {queue.length > 0 && (
           <div className="mb-4">
             <div className="d-flex align-items-center justify-content-between mb-2">
               <span className="fw-semibold" style={{ fontSize: 14 }}>
                 Queue — {queue.length} user{queue.length !== 1 ? "s" : ""}
-                {(isProcessing || (counts.done || counts.skipped || counts.error)) ? (
+                {(counts.done || counts.skipped || counts.error) ? (
                   <span className="ms-2" style={{ fontSize: 12, color: "#6c757d" }}>
                     {counts.done || 0} done · {counts.skipped || 0} skipped · {counts.error || 0} error{(counts.error || 0) !== 1 ? "s" : ""}
                   </span>
                 ) : null}
               </span>
               {!isProcessing && (
-                <button className="btn btn-outline-danger btn-sm" onClick={() => setQueue([])}>
-                  Clear all
-                </button>
+                <button className="btn btn-outline-danger btn-sm" onClick={() => setQueue([])}>Clear all</button>
               )}
             </div>
  
-            {/* Summary bar when processing */}
             {isProcessing && (
-              <div className="mb-2">
-                <div className="progress" style={{ height: 6, borderRadius: 4 }}>
-                  <div className="progress-bar bg-success" style={{ width: `${((counts.done || 0) / queue.length) * 100}%`, transition: "width 0.3s" }} />
-                  <div className="progress-bar bg-warning" style={{ width: `${((counts.processing || 0) / queue.length) * 100}%`, transition: "width 0.3s" }} />
-                </div>
+              <div className="progress mb-2" style={{ height: 6, borderRadius: 4 }}>
+                <div className="progress-bar bg-success"
+                  style={{ width: `${((counts.done || 0) / queue.length) * 100}%`, transition: "width 0.3s" }} />
+                <div className="progress-bar bg-warning"
+                  style={{ width: `${((counts.processing || 0) / queue.length) * 100}%`, transition: "width 0.3s" }} />
               </div>
             )}
  
-            <div style={{ maxHeight: 280, overflowY: "auto", border: "1px solid #dee2e6", borderRadius: 6 }}>
+            <div style={{ maxHeight: 260, overflowY: "auto", border: "1px solid #dee2e6", borderRadius: 6 }}>
               <table className="table table-sm mb-0" style={{ fontSize: 13 }}>
                 <thead style={{ position: "sticky", top: 0, background: "#f8f9fa", zIndex: 1 }}>
                   <tr>
@@ -540,8 +711,11 @@ export default function EmployeeReportGenerator() {
                 </thead>
                 <tbody>
                   {queue.map((emp, idx) => (
-                    <tr key={emp.id}
-                      style={{ background: emp.status === "processing" ? "#fffde7" : emp.status === "done" ? "#f0fff4" : emp.status === "error" ? "#fff5f5" : "" }}>
+                    <tr key={emp.id} style={{
+                      background: emp.status === "processing" ? "#fffde7"
+                        : emp.status === "done"    ? "#f0fff4"
+                        : emp.status === "error"   ? "#fff5f5" : ""
+                    }}>
                       <td style={{ color: "#6c757d" }}>{idx + 1}</td>
                       <td style={{ fontFamily: "monospace" }}>{emp.id}</td>
                       <td>
@@ -569,7 +743,7 @@ export default function EmployeeReportGenerator() {
           </div>
         )}
  
-        {/* Log */}
+        {/* ── Log ── */}
         {progressLog.length > 0 && (
           <div className="mb-4">
             <p className="fw-semibold mb-1" style={{ fontSize: 14 }}>Processing log</p>
@@ -579,26 +753,41 @@ export default function EmployeeReportGenerator() {
               overflowY: "auto", lineHeight: 1.8
             }}>
               {progressLog.map((entry, i) => (
-                <div key={i} style={{ color: LOG_COLOR[entry.type] || LOG_COLOR.info }}>
-                  {entry.msg}
-                </div>
+                <div key={i} style={{ color: LOG_COLOR[entry.type] || LOG_COLOR.info }}>{entry.msg}</div>
               ))}
             </div>
           </div>
         )}
  
-        {/* Action button */}
-        <button className="btn btn-success w-100 py-2" onClick={processFile}
-          disabled={isProcessing || !queue.length || !file}>
-          {isProcessing ? (
-            <>
-              <span className="spinner-border spinner-border-sm me-2" />
-              Processing {queue.length} user{queue.length !== 1 ? "s" : ""}…
-            </>
-          ) : (
-            `Process & Download  (${queue.length} user${queue.length !== 1 ? "s" : ""})`
-          )}
+        {/* ── Process button ── */}
+        <button
+          className="btn btn-success w-100 py-2"
+          onClick={processFile}
+          disabled={!canProcess}
+        >
+          {getButtonLabel()}
         </button>
+ 
+        {/* ── Summary line ── */}
+        {!isProcessing && file && summaryParts.length > 0 && (
+          <p className="text-center mt-2 mb-0" style={{ fontSize: 12, color: "#6c757d" }}>
+            Will: {summaryParts.join(" · ")}
+          </p>
+        )}
+ 
+        {/* ── Hint when file is uploaded but nothing to do ── */}
+        {!isProcessing && file && !hasRowsToInsert && !hasUsers && (
+          <p className="text-center mt-2 mb-0" style={{ fontSize: 12, color: "#856404" }}>
+            Add rows to insert and/or users above to enable processing.
+          </p>
+        )}
+ 
+        {/* ── Hint when no file uploaded ── */}
+        {!file && (
+          <p className="text-center mt-2 mb-0" style={{ fontSize: 12, color: "#6c757d" }}>
+            Upload an Excel file to get started.
+          </p>
+        )}
       </div>
     </div>
   );
